@@ -25,7 +25,7 @@ IS_PROXY     = os.environ.get("IS_PROXY", "false").lower() == "true"   # 是否�
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
 
 # ------------- MWS 站点 / Discord OAuth 配置 -------------
-SITE_ORIGIN = "https://cloud.m-ws.cc"          # 控制台前端（续期 API 入口）
+SITE_ORIGIN = "https://cloud.puratya.com"          # 控制台主域名（实测续期 API 在这个域名上）
 API_ORIGIN  = "https://cloud-api.m-ws.cc"      # 后端 auth 所在域
 COOKIE_NAME = "__Host-mrtcloud_token"
 DISCORD_CLIENT_ID     = "1508034084377464903"
@@ -106,16 +106,20 @@ def update_github_secret(secret_name: str, new_value: str) -> bool:
         print(f"❌ 更新 Secret {secret_name} 异常: {e}")
         return False
 
-def login_headers():
-    """带 COOKIE 的 API 请求头"""
+def headers_for(origin: str):
+    """带 COOKIE 的 API 请求头（Origin/Referer 需与实际请求的域名一致）"""
     return {
         "Accept": "*/*",
         "Accept-Language": "zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7",
         "Content-Type": "application/json",
         "Cookie": f"{COOKIE_NAME}={COOKIE}",
-        "Origin": SITE_ORIGIN,
-        "Referer": f"{SITE_ORIGIN}/",
+        "Origin": origin,
+        "Referer": f"{origin}/",
     }
+
+def login_headers():
+    """兼容旧调用：默认用主域名"""
+    return headers_for(SITE_ORIGIN)
 
 def get_expiry_from_cookie(value: str):
     """从 JWT 里解析过期时间（JST 展示），解析失败返回 None"""
@@ -150,24 +154,29 @@ def parse_remaining(response):
                 return d[k]
     return "未知"
 
+# [补丁9] 控制台正在从 cloud.puratya.com 迁往 cloud.m-ws.cc，两个域名的后端数据未同步：
+#   同一个站点 id（如 1282）在旧域名能续期，在新域名却返回 404「サイトが見つかりません」。
+# 实测浏览器面板调用的是 https://cloud.puratya.com/api/sites/{id}/renew，所以旧域名排第一。
+SITE_ORIGINS = ("https://cloud.puratya.com", "https://cloud.m-ws.cc")
+
 # [补丁7] 站点分 Bot / Web 两类，续期端点不同：
 #   Bot -> POST /api/bots/{id}/renew    Web -> POST /api/sites/{id}/renew
 # 原版只请求 bots 端点，Web 站点会 404「Bot が見つかりません」。这里自动探测并缓存。
-RENEW_TEMPLATES = ("/api/bots/{id}/renew", "/api/sites/{id}/renew")
-_renew_ep_cache = {}
+RENEW_TEMPLATES = ("/api/sites/{id}/renew", "/api/bots/{id}/renew")
+_renew_route_cache = {}   # server_id -> (origin, template)
 
 def renew_server(server_id: str):
-    """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数)"""
-    cached = _renew_ep_cache.get(server_id)
-    templates = (cached,) if cached else RENEW_TEMPLATES
+    """调用续期 API（自动探测 域名 x 端点），返回 (是否成功, HTTP 状态码, 剩余小时数)"""
+    cached = _renew_route_cache.get(server_id)
+    candidates = [cached] if cached else [(o, t) for o in SITE_ORIGINS for t in RENEW_TEMPLATES]
     last_status, last_text = None, ""
 
-    for tmpl in templates:
-        url = SITE_ORIGIN + tmpl.format(id=server_id)
+    for origin, tmpl in candidates:
+        url = origin + tmpl.format(id=server_id)
         try:
             response = requests.post(
                 url,
-                headers=login_headers(),
+                headers=headers_for(origin),
                 timeout=15,
                 impersonate="chrome",
                 proxies=build_proxies(),
@@ -179,20 +188,21 @@ def renew_server(server_id: str):
         last_status = response.status_code
 
         if response.status_code == 200:
-            _renew_ep_cache[server_id] = tmpl
+            _renew_route_cache[server_id] = (origin, tmpl)
             remaining_hours = parse_remaining(response)
-            print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时")
+            print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时"
+                  f"  [{origin}{tmpl.format(id=server_id)}]")
             return True, 200, remaining_hours
 
         if response.status_code == 404:
-            # 该 id 不在这类端点下（Bot/Web 类型不匹配），换下一个端点
+            # 该域名下没有这个站点、或这类端点不匹配，换下一个组合
             last_text = response.text[:120]
             continue
 
         print(f"❌ 服务器 [{server_id}] 续期失败，状态码: {response.status_code}, 响应: {response.text[:300]}")
         return False, response.status_code, None
 
-    print(f"❌ 服务器 [{server_id}] 续期失败：bots / sites 两个端点都不可用"
+    print(f"❌ 服务器 [{server_id}] 续期失败：所有域名/端点组合都不可用"
           f"（最后: HTTP {last_status} {last_text}）")
     return False, last_status, None
 
