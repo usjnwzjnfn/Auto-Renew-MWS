@@ -122,34 +122,68 @@ def get_expiry_from_cookie(value: str):
     except Exception:
         return None
 
+def parse_remaining(response):
+    """兼容 bots / sites 两类端点不同的响应结构"""
+    try:
+        d = response.json()
+    except Exception:
+        return "未知"
+    if isinstance(d, dict):
+        t = d.get("timer")
+        if isinstance(t, dict):
+            for k in ("remaining_hours", "remaining", "hours"):
+                if k in t:
+                    return t[k]
+        for k in ("remaining_hours", "remaining", "hours"):
+            if k in d:
+                return d[k]
+    return "未知"
+
+# [补丁7] 站点分 Bot / Web 两类，续期端点不同：
+#   Bot -> POST /api/bots/{id}/renew    Web -> POST /api/sites/{id}/renew
+# 原版只请求 bots 端点，Web 站点会 404「Bot が見つかりません」。这里自动探测并缓存。
+RENEW_TEMPLATES = ("/api/bots/{id}/renew", "/api/sites/{id}/renew")
+_renew_ep_cache = {}
+
 def renew_server(server_id: str):
     """调用续期 API，返回 (是否成功, HTTP 状态码, 剩余小时数)"""
-    url = f"{SITE_ORIGIN}/api/bots/{server_id}/renew"
+    cached = _renew_ep_cache.get(server_id)
+    templates = (cached,) if cached else RENEW_TEMPLATES
+    last_status, last_text = None, ""
 
-    try:
-        response = requests.post(
-            url,
-            headers=login_headers(),
-            timeout=15,
-            impersonate="chrome",
-            proxies=build_proxies(),
-        )
+    for tmpl in templates:
+        url = SITE_ORIGIN + tmpl.format(id=server_id)
+        try:
+            response = requests.post(
+                url,
+                headers=login_headers(),
+                timeout=15,
+                impersonate="chrome",
+                proxies=build_proxies(),
+            )
+        except Exception as e:
+            print(f"❌ 服务器 [{server_id}] 请求发生异常, 请检查服务器是否被删除: {e}")
+            return False, None, None
+
+        last_status = response.status_code
 
         if response.status_code == 200:
-            try:
-                remaining_hours = response.json().get("timer", {}).get("remaining_hours", "未知")
-            except json.JSONDecodeError:
-                remaining_hours = "未知"
-
+            _renew_ep_cache[server_id] = tmpl
+            remaining_hours = parse_remaining(response)
             print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时")
-            return True, response.status_code, remaining_hours
+            return True, 200, remaining_hours
+
+        if response.status_code == 404:
+            # 该 id 不在这类端点下（Bot/Web 类型不匹配），换下一个端点
+            last_text = response.text[:120]
+            continue
 
         print(f"❌ 服务器 [{server_id}] 续期失败，状态码: {response.status_code}, 响应: {response.text[:300]}")
         return False, response.status_code, None
 
-    except Exception as e:
-        print(f"❌ 服务器 [{server_id}] 请求发生异常, 请检查服务器是否被删除: {e}")
-        return False, None, None
+    print(f"❌ 服务器 [{server_id}] 续期失败：bots / sites 两个端点都不可用"
+          f"（最后: HTTP {last_status} {last_text}）")
+    return False, last_status, None
 
 # ================= Discord OAuth 登录（API 请求失败时的兜底，纯 HTTP） =================
 #   1) GET /auth/login 拿授权 URL（含 state），Session 自动种下 oauth_state cookie
@@ -369,6 +403,26 @@ def main():
 
     if all_ok:
         print("🏁 全部服务器续期成功，续期任务完成")
+
+        # [补丁1] Cookie 提前刷新：原版只在续期失败后才换新 Cookie，
+        #         导致 Cookie 悄悄过期 -> 那次续期失败 -> 站点可能被休眠。
+        #         这里改为剩余不足 7 天就主动刷新，避免踩到空窗期。
+        if COOKIE and DISCORD_TOKEN:
+            exp = get_expiry_from_cookie(COOKIE)
+            if exp:
+                days_left = (exp - datetime.now(timezone.utc)).days
+                print(f"📅 COOKIE 剩余 {days_left} 天")
+                if days_left <= 7:
+                    print("🔄 COOKIE 即将过期(≤7天)，提前走 Discord 登录刷新 ...")
+                    pre = fetch_new_cookie_via_http()
+                    if pre:
+                        COOKIE = pre
+                        new_cookie = pre
+                        print("✅ COOKIE 已提前刷新")
+                    else:
+                        print("⚠️ COOKIE 提前刷新失败，将在下次运行时重试")
+                else:
+                    print("ℹ️ COOKIE 有效期充足，无需刷新")
     else:
         # ---------- COOKIE失效走第二轮：浏览器登录 Discord 获取新 COOKIE ----------
         if not DISCORD_TOKEN:
