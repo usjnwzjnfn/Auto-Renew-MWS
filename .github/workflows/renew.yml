@@ -1,17 +1,28 @@
-
 name: Auto Renew MWS
 
 on:
-  schedule: 
-    - cron: '30 22 */6 * *' # 每6天UTC 22:30 (北京时间6点半, 一般都会推迟8点之后运行),可自行调整
+  schedule:
+    # [补丁2] 原版 cron '30 22 */6 * *' = 北京时间 06:30，且 */6 会造成月末间隔不均
+    #         (6/12/18/24/30 号)，加上 GitHub Actions 常延迟数小时，
+    #         离 7 天休眠线太近。改为每 3 天一次、UTC 02:30(北京时间 10:30)，留足冗余。
+    - cron: '30 2 */3 * *'
   workflow_dispatch:
+
+# [补丁3] 防止上一次运行卡住时重复排队
+concurrency:
+  group: auto-renew-mws
+  cancel-in-progress: false
 
 jobs:
   Renew-mws:
     runs-on: ubuntu-24.04
+    # [补丁4] 单次最长 10 分钟，避免异常时长时间占用 runner
+    timeout-minutes: 10
     permissions:
       actions: write
       contents: write
+      # 注意：GITHUB_TOKEN 无法写 Secrets，写回 COOKIE 用的是 GH_TOKEN(PAT)，
+      # 所以这里不需要 secrets: write。
 
     steps:
       - uses: actions/checkout@v6
@@ -21,18 +32,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ 安装系统依赖和 Python 依赖
+      - name: 🛠️ 安装 Python 依赖
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq wget
-          pip install curl_cffi
+          python -m pip install --upgrade pip
+          # [补丁5] 锁定版本(0.16.3 为当前最新稳定版)，
+          #         避免 curl_cffi 某次更新后 TLS 指纹变化被 CF 拦截或 API 不兼容
+          pip install "curl_cffi==0.16.3"
+          curl_cffi --version 2>/dev/null || python -c "import curl_cffi; print('curl_cffi', curl_cffi.__version__)"
 
-      - name: ⚙ 设置代理 (sing-box)
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      # [补丁6] 已删除原版的「⚙ 设置代理 (sing-box)」步骤：
+      #   bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      # 该步骤从第三方个人站点下载 shell 并直接执行，且在 Secrets 可见的环境中运行，
+      # 属于供应链风险。GitHub Actions Runner 直连 cloud.m-ws.cc 完全正常，无需代理。
 
       - name: 🚀 运行续期脚本
         env:
@@ -47,13 +58,7 @@ jobs:
         run: |
           python3 app.py
 
-      - name: 🧽 清理进程和临时文件
-        if: always()
-        run: |
-          pkill -f sing-box || true
-          rm -f sing-box sing-box-config.json sing-box.log
-
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      # 更新时间到 time.txt，避免 GitHub 因仓库长期无提交而暂停定时任务
       - name: 🕒 提交运行时间
         run: |
           git config user.name "github-actions[bot]"
@@ -64,9 +69,10 @@ jobs:
             echo "No need to commit"
           else
             git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git pull --rebase origin main
             git push origin main
           fi
-          
+
       - name: 🧹 清理旧的工作流运行记录
         if: always()
         env:
@@ -75,7 +81,7 @@ jobs:
           runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
           count=0
           for run_id in $runs; do
-            count=$((count + 1))
+            count=$(( count + 1 ))
             if [ $count -gt 1 ]; then
               echo "删除运行记录: $run_id"
               gh run delete $run_id || true
