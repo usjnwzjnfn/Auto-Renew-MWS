@@ -194,6 +194,10 @@ def renew_server(server_id: str):
                   f"  [{origin}{tmpl.format(id=server_id)}]")
             return True, 200, remaining_hours
 
+        # [补丁10] 每个组合的失败都打出来，方便远程诊断
+        print(f"  ↳ 尝试 {origin}{tmpl.format(id=server_id)}"
+              f" -> HTTP {response.status_code} {response.text[:100]}")
+
         if response.status_code == 404:
             # 该域名下没有这个站点、或这类端点不匹配，换下一个组合
             last_text = response.text[:120]
