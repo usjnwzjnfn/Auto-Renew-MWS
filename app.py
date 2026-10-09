@@ -38,6 +38,17 @@ DISCORD_UA = (
 )
 
 # ==========================================
+import re as _re
+
+def sanitize_cookie(v: str) -> str:
+    """[补丁8] 清洗 Cookie：手动复制时容易混入箭头/中文/空白等杂质，
+    会导致 HTTP 头编码报错(latin-1 encode error)。只保留标准 JWT 三段。"""
+    v = (v or "").strip().strip('"').strip("'")
+    m = _re.search(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+", v)
+    return m.group(0) if m else v
+
+COOKIE = sanitize_cookie(COOKIE)
+
 def build_proxies():
     """按配置返回 curl_cffi 需要的代理字典，未启用则返回 None"""
     if IS_PROXY:
