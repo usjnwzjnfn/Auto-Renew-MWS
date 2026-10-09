@@ -386,6 +386,45 @@ def fetch_new_cookie_via_http() -> str:
         return ""
 
 # ================= 主流程 =================
+# [补丁11] 自动发现站点：SERVER_IDS 留空或填 auto 时，
+#   直接调列表接口拿 id 并绑定续期路线，彻底避免手填出错。
+def discover_all_sites():
+    ids = []
+    for origin in SITE_ORIGINS:
+        for list_path, tmpl in (("/api/sites", "/api/sites/{id}/renew"),
+                                ("/api/bots", "/api/bots/{id}/renew")):
+            try:
+                r = requests.get(origin + list_path,
+                                 headers=headers_for(origin),
+                                 timeout=20, impersonate="chrome",
+                                 proxies=build_proxies())
+            except Exception as e:
+                print(f"  ↳ {origin}{list_path} -> 异常 {e}")
+                continue
+            if r.status_code != 200:
+                print(f"  ↳ {origin}{list_path} -> HTTP {r.status_code}")
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                continue
+            items = data if isinstance(data, list) else []
+            if isinstance(data, dict):
+                for k in ("sites", "bots", "items", "data", "results"):
+                    if isinstance(data.get(k), list):
+                        items = data[k]
+                        break
+            for it in items:
+                if isinstance(it, dict) and it.get("id") is not None:
+                    sid = str(it["id"])
+                    ids.append(sid)
+                    _renew_route_cache[sid] = (origin, tmpl)
+                    nm = it.get("name") or it.get("display_name") or "(无名)"
+                    print(f"  ✔ 发现站点 {nm}  id={sid}  @ {origin}{list_path}")
+            if ids:
+                return ids
+    return ids
+
 def main():
     global COOKIE
 
@@ -393,10 +432,19 @@ def main():
     print("   MWS 自动续期")
     print("#" * 25)
 
-    server_list = [s_id.strip() for s_id in SERVER_IDS.split(",") if s_id.strip()]
-    if not server_list:
-        print("❌ 未配置有效的 SERVER_IDS")
-        return
+    server_list = [s_id.strip().strip("'\"") for s_id in SERVER_IDS.split(",") if s_id.strip()]
+    auto_mode = (not server_list) or (len(server_list) == 1 and server_list[0].lower() == "auto")
+
+    if auto_mode:
+        print("🔍 SERVER_IDS 未配置(或填 auto)，自动发现账号下所有站点 ...")
+        server_list = discover_all_sites()
+        if not server_list:
+            print("❌ 自动发现失败（Cookie 可能失效），请检查 COOKIE 或手动填 SERVER_IDS")
+            return
+    elif COOKIE:
+        # 手填模式下打印 id 诊断信息（值会被 GitHub 打码，但长度/字符类型不会）
+        for s_id in server_list:
+            print(f"ℹ️ SERVER_IDS 诊断: 长度={len(s_id)} 纯数字={s_id.isdigit()}")
 
     if not COOKIE and not DISCORD_TOKEN:
         print("❌ COOKIE 和 DISCORD_TOKEN 均为空，请添加相关变量后再运行！")
